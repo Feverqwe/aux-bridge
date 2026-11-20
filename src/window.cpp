@@ -1,7 +1,10 @@
 #include "audio_bridge.h"
 #include "launcher.h"
 
+#include <CoreFoundation/CoreFoundation.h>
+
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialog>
 #include <QFormLayout>
@@ -10,10 +13,14 @@
 #include <QLabel>
 #include <QMenu>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPointer>
 #include <QPushButton>
 #include <QScreen>
 #include <QScrollArea>
+#include <QScrollBar>
+#include <QSettings>
+#include <QShortcut>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QSystemTrayIcon>
@@ -26,6 +33,76 @@
 namespace {
 using DeviceList = std::expected<std::vector<AudioDevice>, OSStatus>;
 
+void reveal(QWidget& window) {
+    if (window.isMinimized())
+        window.showNormal();
+    else
+        window.show();
+    window.raise();
+    window.activateWindow();
+}
+
+class Settings final : public QDialog {
+public:
+    explicit Settings(QSystemTrayIcon& tray)
+        : tray_(tray), menuBarAvailable_(QSystemTrayIcon::isSystemTrayAvailable()),
+          preferences_(QSettings::NativeFormat, QSettings::UserScope, preferencesDomain()) {
+        setWindowTitle("Aux Bridge Settings");
+        auto* layout = new QVBoxLayout(this);
+        layout->addWidget(&menuBar_);
+        layout->addWidget(&dock_);
+        layout->addWidget(&status_);
+        apply(preferences_.value("showInMenuBar", true).toBool(),
+              preferences_.value("showInDock", false).toBool());
+
+        const auto change = [this] { apply(menuBar_.isChecked(), dock_.isChecked()); };
+        connect(&menuBar_, &QCheckBox::clicked, this, change);
+        connect(&dock_, &QCheckBox::clicked, this, change);
+    }
+
+private:
+    static QString preferencesDomain() {
+        const auto identifier = CFBundleGetIdentifier(CFBundleGetMainBundle());
+        return identifier ? QString::fromCFString(identifier) : QString("app.auxbridge.desktop");
+    }
+
+    void apply(bool menuBar, bool dock) {
+        if (!menuBarAvailable_) {
+            menuBar = false;
+            dock = true;
+        } else if (!menuBar && !dock) {
+            menuBar = true;
+        }
+
+        // Show the replacement before hiding the current way back into the app.
+        if (menuBar)
+            tray_.show();
+        if (dock != dockIconVisible())
+            setDockIconVisible(dock);
+        const bool dockShown = dockIconVisible();
+        menuBar = menuBar || (menuBarAvailable_ && !dockShown);
+        tray_.setVisible(menuBar);
+        QApplication::setQuitOnLastWindowClosed(!menuBar && !dockShown);
+
+        menuBar_.setChecked(menuBar);
+        menuBar_.setEnabled(menuBarAvailable_ && (!menuBar || dockShown));
+        dock_.setChecked(dockShown);
+        dock_.setEnabled(!dockShown || menuBar);
+        status_.setText(dock != dockShown
+            ? "macOS could not change the Dock icon."
+            : "Keep at least one icon visible to reopen Aux Bridge.");
+        preferences_.setValue("showInMenuBar", menuBar);
+        preferences_.setValue("showInDock", dockShown);
+    }
+
+    QSystemTrayIcon& tray_;
+    const bool menuBarAvailable_;
+    QSettings preferences_;
+    QCheckBox menuBar_{"Show in Menu Bar"};
+    QCheckBox dock_{"Show in Dock"};
+    QLabel status_;
+};
+
 class Route final : public QFrame {
 public:
     Route(QWidget* parent, bool selectDefaultOutput)
@@ -36,8 +113,15 @@ public:
         auto* controls = new QHBoxLayout;
         auto* devices = new QFormLayout;
         devices->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-        setupDevice(*devices, input_, "&Input", "Input");
-        setupDevice(*devices, output_, "&Output", "Output");
+        setupDevice(input_, "Input");
+        setupDevice(output_, "Output");
+        devices->addRow("&Input", &input_);
+        auto* outputControls = new QHBoxLayout;
+        outputControls->addWidget(&output_, 1);
+        outputControls->addWidget(&addOutput_);
+        auto* outputLabel = new QLabel("&Output", this);
+        outputLabel->setBuddy(&output_);
+        devices->addRow(outputLabel, outputControls);
         controls->addLayout(devices, 1);
 
         auto* volume = new QVBoxLayout;
@@ -67,6 +151,8 @@ public:
         content->addLayout(footer);
         remove_.setAutoDefault(false);
         toggle_.setAutoDefault(false);
+        addOutput_.setAutoDefault(false);
+        addOutput_.setToolTip("Add another output for this input");
         connect(&toggle_, &QPushButton::clicked, this, [this] { toggle(); });
         const auto deviceSelected = [this] {
             message_.clear();
@@ -77,6 +163,10 @@ public:
     }
 
     QPushButton& removeButton() { return remove_; }
+    QPushButton& addOutputButton() { return addOutput_; }
+    AudioDeviceID inputDevice() const { return selected(input_); }
+    void selectInput(AudioDeviceID id) { input_.setCurrentIndex(input_.findData(id)); }
+    void focusOutput() { output_.setFocus(); }
     void focusInput() { input_.setFocus(); }
     void deactivate() {
         waiting_ = false;
@@ -116,6 +206,7 @@ public:
         const bool ready = devices && selected(input_) && selected(output_);
         input_.setEnabled(devices && input_.count() > 0);
         output_.setEnabled(devices && output_.count() > 0);
+        addOutput_.setEnabled(devices && selected(input_));
         toggle_.setText("Start");
         toggle_.setEnabled(ready);
         if (!devices)
@@ -129,12 +220,10 @@ public:
     }
 
 private:
-    static void setupDevice(QFormLayout& form, QComboBox& combo,
-                            const QString& label, const QString& accessibleName) {
+    static void setupDevice(QComboBox& combo, const QString& accessibleName) {
         combo.setAccessibleName(accessibleName);
         combo.setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
         combo.setMinimumContentsLength(22);
-        form.addRow(label, &combo);
     }
 
     static AudioDeviceID selected(const QComboBox& combo) { return combo.currentData().toUInt(); }
@@ -210,6 +299,7 @@ private:
     QLabel status_;
     QPushButton toggle_{"Start"};
     QPushButton remove_{"Remove"};
+    QPushButton addOutput_{"Add Output"};
     QSlider volume_{Qt::Horizontal};
     QString message_;
     std::vector<AudioDevice> devices_;
@@ -227,6 +317,7 @@ public:
         auto* content = new QVBoxLayout(this);
         scroll_.setWidgetResizable(true);
         scroll_.setFrameShape(QFrame::NoFrame);
+        scroll_.setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         panels_ = new QWidget;
         routesLayout_ = new QVBoxLayout(panels_);
         routesLayout_->setContentsMargins(0, 0, 0, 0);
@@ -236,11 +327,16 @@ public:
         content->addWidget(&empty_);
         empty_.setAlignment(Qt::AlignCenter);
 
-        content->addWidget(&add_, 0, Qt::AlignRight);
+        auto* footer = new QHBoxLayout;
+        footer->addWidget(&settings_);
+        footer->addStretch();
+        footer->addWidget(&add_);
+        content->addLayout(footer);
+        settings_.setAutoDefault(false);
         add_.setAutoDefault(false);
         connect(&add_, &QPushButton::clicked, this, [this] { addRoute(); });
         addRoute();
-        resize(540, routes_.front()->sizeHint().height() + 70);
+        resize(610, routes_.front()->sizeHint().height() + 70);
 
         connect(&timer_, &QTimer::timeout, this, [this] {
             if (routes_.empty())
@@ -252,13 +348,20 @@ public:
         timer_.start(350);
     }
 
-    void addRoute() {
+    QPushButton& settingsButton() { return settings_; }
+
+    void addRoute(AudioDeviceID input = kAudioObjectUnknown) {
         auto* route = new Route(panels_, routes_.empty());
         routes_.push_back(route);
         routesLayout_->insertWidget(routesLayout_->count() - 1, route);
         scroll_.show();
         empty_.hide();
         route->refresh(audioDevices());
+        if (input != kAudioObjectUnknown)
+            route->selectInput(input);
+        connect(&route->addOutputButton(), &QPushButton::clicked, this, [this, route] {
+            addRoute(route->inputDevice());
+        });
         connect(&route->removeButton(), &QPushButton::clicked, this, [this, route] {
             route->deactivate();
             std::erase(routes_, route);
@@ -269,22 +372,30 @@ public:
             empty_.setVisible(routes_.empty());
             add_.setFocus();
         });
-        if (isVisible() && routes_.size() > 1) {
-            const auto limit = screen()->availableGeometry().height() * 3 / 4;
-            const int extra = route->sizeHint().height() + routesLayout_->spacing();
-            if (height() < limit)
-                resize(width(), std::min(height() + extra, limit));
-        }
-        route->focusInput();
+        if (input == kAudioObjectUnknown)
+            route->focusInput();
+        else
+            route->focusOutput();
         QTimer::singleShot(0, this, [this, route = QPointer<Route>(route)] {
-            if (route)
-                scroll_.ensureWidgetVisible(route, 0, 0);
+            if (!route)
+                return;
+            routesLayout_->activate();
+            const auto margins = layout()->contentsMargins();
+            setMinimumWidth(panels_->minimumSizeHint().width() + margins.left() + margins.right() +
+                            scroll_.verticalScrollBar()->sizeHint().width());
+            const int required = routesLayout_->sizeHint().height() + height() - scroll_.viewport()->height();
+            const int limit = screen()->availableGeometry().height() * 3 / 4;
+            const int fitted = std::min(required, limit);
+            if (fitted > height())
+                resize(width(), fitted);
+            scroll_.ensureWidgetVisible(route, 0, 0);
         });
     }
 
 private:
     QScrollArea scroll_;
     QLabel empty_{"No routes"};
+    QPushButton settings_{"Settings…"};
     QPushButton add_{"Add Route"};
     QTimer timer_;
     QWidget* panels_ = nullptr;
@@ -300,11 +411,15 @@ QIcon menuBarIcon() {
     image.fill(Qt::transparent);
     QPainter painter(&image);
     painter.setRenderHint(QPainter::Antialiasing);
-    painter.setPen(QPen(Qt::black, 1.8, Qt::SolidLine, Qt::RoundCap));
-    painter.drawLine(QPointF(3, 8), QPointF(3, 10));
-    painter.drawLine(QPointF(7, 5), QPointF(7, 13));
-    painter.drawLine(QPointF(11, 3), QPointF(11, 15));
-    painter.drawLine(QPointF(15, 6), QPointF(15, 12));
+    painter.setPen(QPen(Qt::black, 1.8, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    QPainterPath signal(QPointF(2.5, 9));
+    signal.lineTo(7.4, 9);
+    signal.cubicTo(10, 9, 10.25, 5, 13, 5);
+    signal.lineTo(15.5, 5);
+    signal.moveTo(7.4, 9);
+    signal.cubicTo(10, 9, 10.25, 13, 13, 13);
+    signal.lineTo(15.5, 13);
+    painter.drawPath(signal);
     painter.end();
 
     QIcon icon(image);
@@ -317,25 +432,31 @@ int runAuxBridge(int argc, char** argv) {
     app.setApplicationDisplayName("Aux Bridge");
     Window window;
     QMenu menu;
+    QMenu dockMenu;
     QSystemTrayIcon tray(menuBarIcon());
-    if (QSystemTrayIcon::isSystemTrayAvailable()) {
-        app.setQuitOnLastWindowClosed(false);
-        const auto showWindow = [&window] {
-            window.showNormal();
-            window.raise();
-            window.activateWindow();
-        };
-        menu.addAction("Open Aux Bridge", &window, showWindow);
-        menu.addAction("Add Route", &window, [&window, showWindow] {
+    tray.setContextMenu(&menu);
+    tray.setToolTip("Aux Bridge");
+    Settings settings(tray);
+
+    const auto showWindow = [&window] { reveal(window); };
+    const auto showSettings = [&settings] { reveal(settings); };
+    QObject::connect(&window.settingsButton(), &QPushButton::clicked, &settings, showSettings);
+    QShortcut settingsShortcut(QKeySequence::Preferences, &window, showSettings, Qt::ApplicationShortcut);
+    menu.addAction("Open Aux Bridge", &window, showWindow);
+    menu.addAction("Add Route", &window, [&window, showWindow] {
+        showWindow();
+        window.addRoute();
+    });
+    menu.addAction("Settings…", &settings, showSettings);
+    menu.addSeparator();
+    menu.addAction("Quit Aux Bridge", &app, &QApplication::quit);
+    dockMenu.addAction("Open Aux Bridge", &window, showWindow);
+    dockMenu.addAction("Settings…", &settings, showSettings);
+    dockMenu.setAsDockMenu();
+    QObject::connect(&app, &QApplication::applicationStateChanged, &window, [&](Qt::ApplicationState state) {
+        if (state == Qt::ApplicationActive && !window.isVisible() && !settings.isVisible())
             showWindow();
-            window.addRoute();
-        });
-        menu.addSeparator();
-        menu.addAction("Quit Aux Bridge", &app, &QApplication::quit);
-        tray.setContextMenu(&menu);
-        tray.setToolTip("Aux Bridge");
-        tray.show();
-    }
+    });
     window.show();
     return app.exec();
 }

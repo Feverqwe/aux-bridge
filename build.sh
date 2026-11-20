@@ -37,15 +37,15 @@ staging=$(mktemp -d "build/.bundle.XXXXXXXX")
 trap 'rm -rf "$staging"' EXIT
 bundle="$staging/Aux Bridge.app"
 
-mkdir -p "$bundle/Contents/MacOS"
+resources="$bundle/Contents/Resources"
+mkdir -p "$bundle/Contents/MacOS" "$resources"
 cp Info.plist "$bundle/Contents/Info.plist"
+cp assets/AuxBridge.icns "$resources/"
 binary="$bundle/Contents/MacOS/Aux Bridge"
 go build -trimpath -o "$binary" ./src
 install_name_tool -add_rpath "$qt_libdir" "$binary"
 
 if [ "${1:-}" = "--deploy" ]; then
-    resources="$bundle/Contents/Resources"
-    mkdir -p "$resources"
     cp THIRD_PARTY_NOTICES.md "$resources/"
     qt_licenses="$(pkg-config --variable=prefix Qt6Widgets)/share/qtbase/LICENSES"
     if [ -d "$qt_licenses" ]; then

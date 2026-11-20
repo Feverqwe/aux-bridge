@@ -8,6 +8,8 @@ extern "C" {
 
 int runAuxBridge(int argc, char** argv);
 void requestMicrophoneAccess(void (*completed)(bool));
+bool dockIconVisible(void);
+void setDockIconVisible(bool visible);
 
 #ifdef __cplusplus
 }

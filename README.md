@@ -11,8 +11,8 @@
 ## Your audio, where you want it
 
 - Send a monitor’s AUX signal from a USB audio interface to a Bluetooth speaker without changing your Mac’s system output.
-- Play one input through several outputs, or run separate routes side by side.
-- Start, stop, and adjust the volume of each route independently. Closing the window keeps your routes running in the menu bar.
+- Use **Add Output** to send one input to another device, or run separate routes side by side.
+- Start, stop, and adjust the volume of each route independently. Closing the window keeps your routes running.
 
 ## Start listening
 
@@ -21,5 +21,7 @@
 3. Click **Add Route** to set up another connection.
 
 Bluetooth devices add their own playback delay.
+
+In **Settings**, choose where to show the app icon. You can use the menu bar, the Dock, or both.
 
 [Build from source](docs/build.md)

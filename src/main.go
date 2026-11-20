@@ -3,7 +3,7 @@ package main
 /*
 #cgo pkg-config: Qt6Widgets
 #cgo CXXFLAGS: -std=c++23 -Wall -Wextra
-#cgo LDFLAGS: -framework CoreAudio -framework AudioToolbox -framework CoreFoundation -framework AVFoundation -framework Foundation
+#cgo LDFLAGS: -framework CoreAudio -framework AudioToolbox -framework CoreFoundation -framework AVFoundation -framework AppKit -framework Foundation
 #include <stdlib.h>
 #include "launcher.h"
 */
