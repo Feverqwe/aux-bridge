@@ -15,11 +15,13 @@ case "${1:-}" in
             echo "The release tag must match Info.plist ($tag)." >&2
             exit 1
         fi
-        ./build.sh --deploy
         archive="build/aux-bridge-$tag-macos-$(uname -m).zip"
+        mkdir -p build
         stage=$(mktemp -d "build/.release.XXXXXXXX")
         trap 'rm -rf "$stage"' EXIT
-        ditto -c -k --sequesterRsrc --keepParent 'build/Aux Bridge.app' "$stage/app.zip"
+        trap 'exit 1' HUP INT TERM
+        AUX_BRIDGE_BUILD_DIR="$stage" ./build.sh --deploy >&2
+        ditto -c -k --sequesterRsrc --keepParent "$stage/Aux Bridge.app" "$stage/app.zip"
         mv "$stage/app.zip" "$archive"
         printf '%s\n' "$archive"
         ;;

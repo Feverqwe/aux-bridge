@@ -31,11 +31,23 @@ export CGO_ENABLED=1
 export MACOSX_DEPLOYMENT_TARGET=14.4
 export CGO_LDFLAGS="${CGO_LDFLAGS:--O2 -g} -Wl,-headerpad_max_install_names"
 
-app="build/Aux Bridge.app"
-mkdir -p build
-staging=$(mktemp -d "build/.bundle.XXXXXXXX")
-trap 'rm -rf "$staging"' EXIT
+build_dir=${AUX_BRIDGE_BUILD_DIR:-build}
+app="$build_dir/Aux Bridge.app"
+mkdir -p "$build_dir"
+staging=$(mktemp -d "$build_dir/.bundle.XXXXXXXX")
 bundle="$staging/Aux Bridge.app"
+previous="$staging/previous"
+cleanup() {
+    if [ -e "$previous/Aux Bridge.app" ] && [ ! -e "$app" ]; then
+        if ! mv -n "$previous/Aux Bridge.app" "$build_dir"; then
+            printf 'Previous build kept at %s\n' "$previous/Aux Bridge.app" >&2
+            return
+        fi
+    fi
+    rm -rf "$staging"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
 resources="$bundle/Contents/Resources"
 mkdir -p "$bundle/Contents/MacOS" "$resources"
@@ -52,18 +64,21 @@ if [ "${1:-}" = "--deploy" ]; then
         cp -R "$qt_licenses" "$resources/Qt-LICENSES"
     fi
     "$qt_bindir/macdeployqt" "$bundle" -no-strip
+    if [ ! -f "$bundle/Contents/PlugIns/platforms/libqcocoa.dylib" ]; then
+        echo "Qt deployment did not include the Cocoa platform plugin." >&2
+        exit 1
+    fi
     if otool -l "$binary" | grep -Fq "path $qt_libdir (offset"; then
         install_name_tool -delete_rpath "$qt_libdir" "$binary"
     fi
 fi
 codesign --force --sign - "$bundle"
+if [ "${1:-}" = "--deploy" ]; then
+    codesign --verify --deep --strict "$bundle"
+fi
 if [ -e "$app" ]; then
-    mv "$app" "$staging/previous"
+    mkdir "$previous"
+    mv "$app" "$previous"
 fi
-if ! mv "$bundle" "$app"; then
-    if [ -e "$staging/previous" ]; then
-        mv "$staging/previous" "$app"
-    fi
-    exit 1
-fi
+mv "$bundle" "$build_dir"
 echo "$app"

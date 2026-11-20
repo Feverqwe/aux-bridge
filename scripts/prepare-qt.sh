@@ -48,5 +48,9 @@ cmake --build "$scratch/build" --parallel "$(sysctl -n hw.ncpu)" >&2
 DESTDIR="$scratch/install" cmake --install "$scratch/build" >&2
 mkdir -p "$scratch/install$prefix/share/qtbase"
 cp -R "$scratch/qtbase-everywhere-src-$version/LICENSES" "$scratch/install$prefix/share/qtbase/"
-mv "$scratch/install$prefix" "$prefix"
+mv -n "$scratch/install$prefix" "$base"
+if [ ! -x "$prefix/bin/macdeployqt" ]; then
+    printf 'The Qt installation at %s is incomplete. Move it aside and run this script again.\n' "$prefix" >&2
+    exit 1
+fi
 printf '%s\n' "$prefix"

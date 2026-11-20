@@ -7,6 +7,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialog>
+#include <QEvent>
 #include <QFormLayout>
 #include <QFrame>
 #include <QHBoxLayout>
@@ -28,6 +29,8 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
 namespace {
@@ -110,33 +113,42 @@ public:
         setFrameShape(QFrame::StyledPanel);
         setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
         auto* content = new QVBoxLayout(this);
-        auto* controls = new QHBoxLayout;
         auto* devices = new QFormLayout;
         devices->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
         setupDevice(input_, "Input");
         setupDevice(output_, "Output");
-        devices->addRow("&Input", &input_);
+        setupChannels(inputChannels_, "Input channels");
+        setupChannels(outputChannels_, "Output channels");
+        auto* inputControls = new QHBoxLayout;
+        inputControls->addWidget(&input_, 1);
+        inputControls->addWidget(&inputChannels_);
+        auto* inputLabel = new QLabel("&Input", this);
+        inputLabel->setBuddy(&input_);
+        devices->addRow(inputLabel, inputControls);
         auto* outputControls = new QHBoxLayout;
         outputControls->addWidget(&output_, 1);
+        outputControls->addWidget(&outputChannels_);
         outputControls->addWidget(&addOutput_);
         auto* outputLabel = new QLabel("&Output", this);
         outputLabel->setBuddy(&output_);
         devices->addRow(outputLabel, outputControls);
-        controls->addLayout(devices, 1);
-
-        auto* volume = new QVBoxLayout;
+        auto* volumeControls = new QHBoxLayout;
         auto* volumeLabel = new QLabel("&Volume", this);
         volumeLabel->setBuddy(&volume_);
         volume_.setAccessibleName("Volume");
+        volume_.setAttribute(Qt::WA_MacSmallSize);
+        volume_.setMaximumWidth(190);
         volume_.setRange(0, 100);
         volume_.setValue(100);
-        volume_.setToolTip("100%");
-        volume->addWidget(volumeLabel);
-        volume->addWidget(&volume_);
-        controls->addLayout(volume);
-        content->addLayout(controls);
+        volumeValue_.setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        volumeValue_.setMinimumWidth(volumeValue_.sizeHint().width());
+        volumeControls->addWidget(&volume_, 1);
+        volumeControls->addWidget(&volumeValue_);
+        volumeControls->addStretch(1);
+        devices->addRow(volumeLabel, volumeControls);
+        content->addLayout(devices);
         connect(&volume_, &QSlider::valueChanged, this, [this](int percent) {
-            volume_.setToolTip(QString::number(percent) + "%");
+            volumeValue_.setText(QString::number(percent) + "%");
             bridge_.setVolume(percent / 100.0f);
         });
 
@@ -154,18 +166,29 @@ public:
         addOutput_.setAutoDefault(false);
         addOutput_.setToolTip("Add another output for this input");
         connect(&toggle_, &QPushButton::clicked, this, [this] { toggle(); });
-        const auto deviceSelected = [this] {
-            message_.clear();
-            refresh(audioDevices());
-        };
-        connect(&input_, &QComboBox::currentIndexChanged, this, deviceSelected);
-        connect(&output_, &QComboBox::currentIndexChanged, this, deviceSelected);
+        connect(&input_, &QComboBox::currentIndexChanged, this, [this] {
+            populateChannels(inputChannels_, channelCount(input_), 0);
+            selectionChanged();
+        });
+        connect(&output_, &QComboBox::currentIndexChanged, this, [this] {
+            populateChannels(outputChannels_, channelCount(output_), 0);
+            selectionChanged();
+        });
+        connect(&inputChannels_, &QComboBox::currentIndexChanged, this, [this] { selectionChanged(); });
+        connect(&outputChannels_, &QComboBox::currentIndexChanged, this, [this] { selectionChanged(); });
     }
 
     QPushButton& removeButton() { return remove_; }
     QPushButton& addOutputButton() { return addOutput_; }
     AudioDeviceID inputDevice() const { return selected(input_); }
-    void selectInput(AudioDeviceID id) { input_.setCurrentIndex(input_.findData(id)); }
+    int inputChannel() const { return selectedChannel(inputChannels_); }
+    void selectInput(AudioDeviceID id, int firstChannel) {
+        input_.setCurrentIndex(input_.findData(id));
+        if (inputChannels_.count())
+            inputChannels_.setCurrentIndex(inputChannels_.findData(firstChannel));
+        else if (firstChannel != 0)
+            input_.setCurrentIndex(-1);
+    }
     void focusOutput() { output_.setFocus(); }
     void focusInput() { input_.setFocus(); }
     void deactivate() {
@@ -197,26 +220,32 @@ public:
                        a.inputChannels == b.inputChannels && a.outputChannels == b.outputChannels;
             };
             if (!populated_ || !std::ranges::equal(*devices, devices_, sameDevice)) {
-                populate(input_, *devices, true);
-                populate(output_, *devices, false, selectDefaultOutput_ || selected(output_));
+                populate(input_, inputChannels_, *devices, true, !populated_);
+                populate(output_, outputChannels_, *devices, false, !populated_ && selectDefaultOutput_);
                 devices_ = *devices;
                 populated_ = true;
             }
         }
-        const bool ready = devices && selected(input_) && selected(output_);
+        const bool ready = devices && readyToStart();
         input_.setEnabled(devices && input_.count() > 0);
         output_.setEnabled(devices && output_.count() > 0);
-        addOutput_.setEnabled(devices && selected(input_));
+        inputChannels_.setEnabled(devices.has_value());
+        outputChannels_.setEnabled(devices.has_value());
+        addOutput_.setEnabled(devices && selected(input_) && inputChannel() >= 0);
         toggle_.setText("Start");
         toggle_.setEnabled(ready);
         if (!devices)
             status_.setText(QString("Could not list audio devices (Core Audio %1).").arg(devices.error()));
+        else if (!message_.isEmpty())
+            status_.setText(message_);
         else if (!input_.count() || !output_.count())
             status_.setText("Connect an audio input and output to start.");
-        else if (!ready)
+        else if (!selected(input_) || !selected(output_))
             status_.setText("Choose an input and output to start.");
+        else if (!ready)
+            status_.setText("Choose input and output channels to start.");
         else
-            status_.setText(message_.isEmpty() ? "Ready to route audio." : message_);
+            status_.setText("Ready to route audio.");
     }
 
 private:
@@ -228,24 +257,90 @@ private:
 
     static AudioDeviceID selected(const QComboBox& combo) { return combo.currentData().toUInt(); }
 
-    static void populate(QComboBox& combo, const std::vector<AudioDevice>& devices, bool input,
-                         bool selectDefault = true) {
+    static void setupChannels(QComboBox& combo, const QString& label) {
+        combo.setAccessibleName(label);
+        combo.setToolTip(label);
+        combo.setPlaceholderText("Channels");
+        combo.hide();
+    }
+
+    static unsigned channelCount(const QComboBox& combo) {
+        return combo.currentData(Qt::UserRole + 1).toUInt();
+    }
+
+    static int selectedChannel(const QComboBox& combo) {
+        return combo.count() && combo.currentIndex() < 0 ? -1 : combo.currentData().toInt();
+    }
+
+    static void populateChannels(QComboBox& combo, unsigned count, int firstChannel) {
+        const QSignalBlocker blocker(&combo);
+        combo.clear();
+        if (count > 2) {
+            for (unsigned channel = 0; channel < count; channel += 2) {
+                const QString name = channel + 1 < count
+                    ? QString("Ch. %1–%2").arg(channel + 1).arg(channel + 2)
+                    : QString("Ch. %1").arg(channel + 1);
+                combo.addItem(name, static_cast<int>(channel));
+            }
+            combo.setCurrentIndex(combo.findData(firstChannel));
+        }
+        combo.setVisible(count > 2);
+    }
+
+    static void populate(QComboBox& combo, QComboBox& channelCombo, const std::vector<AudioDevice>& devices,
+                         bool input, bool selectDefault) {
         const auto previous = selected(combo);
-        const auto fallback = defaultAudioDevice(input);
+        const auto firstChannel = selectedChannel(channelCombo);
         const QSignalBlocker blocker(&combo);
         combo.clear();
         for (const auto& info : devices) {
-            if (input ? info.inputChannels : info.outputChannels)
+            const auto count = input ? info.inputChannels : info.outputChannels;
+            if (count) {
                 combo.addItem(QString::fromStdString(info.name), info.id);
+                combo.setItemData(combo.count() - 1, count, Qt::UserRole + 1);
+            }
         }
         const auto kept = combo.findData(previous);
-        const auto system = selectDefault ? combo.findData(fallback) : -1;
+        const auto system = selectDefault ? combo.findData(defaultAudioDevice(input)) : -1;
         const auto first = selectDefault && combo.count() > 0 ? 0 : -1;
         combo.setCurrentIndex(kept >= 0 ? kept : system >= 0 ? system : first);
+        if (kept >= 0 && channelCount(combo) <= 2 && firstChannel != 0)
+            combo.setCurrentIndex(-1);
+        populateChannels(channelCombo, channelCount(combo), kept >= 0 ? firstChannel : 0);
         if (combo.count() == 0)
             combo.setPlaceholderText(input ? "No audio inputs" : "No audio outputs");
         else
             combo.setPlaceholderText(input ? "Choose input" : "Choose output");
+    }
+
+    bool readyToStart() const {
+        return selected(input_) && selected(output_) && inputChannel() >= 0 &&
+               selectedChannel(outputChannels_) >= 0;
+    }
+
+    void selectionChanged() {
+        message_.clear();
+        refresh(audioDevices());
+    }
+
+    void disableSelections() {
+        input_.setEnabled(false);
+        output_.setEnabled(false);
+        inputChannels_.setEnabled(false);
+        outputChannels_.setEnabled(false);
+    }
+
+    static void permissionCompleted(bool allowed) noexcept {
+        try {
+            auto requests = std::exchange(pendingPermission_, {});
+            for (const auto& route : requests) {
+                if (route && route->waiting_)
+                    route->start(allowed);
+            }
+        } catch (...) {
+            std::fputs("Aux Bridge: could not process microphone permission.\n", stderr);
+            QApplication::exit(EXIT_FAILURE);
+        }
     }
 
     void toggle() {
@@ -257,20 +352,12 @@ private:
         }
         waiting_ = true;
         message_.clear();
-        input_.setEnabled(false);
-        output_.setEnabled(false);
+        disableSelections();
         toggle_.setEnabled(false);
         status_.setText("Checking microphone access…");
         pendingPermission_.push_back(this);
-        if (pendingPermission_.size() == 1) {
-            requestMicrophoneAccess([](bool allowed) {
-                auto requests = std::exchange(pendingPermission_, {});
-                for (const auto& route : requests) {
-                    if (route && route->waiting_)
-                        route->start(allowed);
-                }
-            });
-        }
+        if (pendingPermission_.size() == 1)
+            requestMicrophoneAccess(permissionCompleted);
     }
 
     void start(bool allowed) {
@@ -280,27 +367,36 @@ private:
             refresh(audioDevices());
             return;
         }
-        auto result = bridge_.start(selected(input_), selected(output_));
+        const auto devices = audioDevices();
+        refresh(devices);
+        if (!devices || !readyToStart())
+            return;
+        auto result = bridge_.start(selected(input_), selected(output_), static_cast<unsigned>(inputChannel()),
+                                    static_cast<unsigned>(selectedChannel(outputChannels_)));
         if (!result) {
             message_ = QString("%1 failed (Core Audio %2).")
                 .arg(QString::fromLatin1(result.error().stage)).arg(result.error().status);
             refresh(audioDevices());
             return;
         }
+        disableSelections();
         toggle_.setText("Stop");
         toggle_.setEnabled(true);
-        refresh(audioDevices());
+        refresh(devices);
     }
 
     static inline std::vector<QPointer<Route>> pendingPermission_;
     AudioBridge bridge_;
     QComboBox input_;
+    QComboBox inputChannels_;
     QComboBox output_;
+    QComboBox outputChannels_;
     QLabel status_;
     QPushButton toggle_{"Start"};
     QPushButton remove_{"Remove"};
     QPushButton addOutput_{"Add Output"};
     QSlider volume_{Qt::Horizontal};
+    QLabel volumeValue_{"100%"};
     QString message_;
     std::vector<AudioDevice> devices_;
     bool populated_ = false;
@@ -323,6 +419,7 @@ public:
         routesLayout_->setContentsMargins(0, 0, 0, 0);
         routesLayout_->addStretch();
         scroll_.setWidget(panels_);
+        panels_->installEventFilter(this);
         content->addWidget(&scroll_, 1);
         content->addWidget(&empty_);
         empty_.setAlignment(Qt::AlignCenter);
@@ -336,7 +433,7 @@ public:
         add_.setAutoDefault(false);
         connect(&add_, &QPushButton::clicked, this, [this] { addRoute(); });
         addRoute();
-        resize(610, routes_.front()->sizeHint().height() + 70);
+        resize(610, sizeHint().height());
 
         connect(&timer_, &QTimer::timeout, this, [this] {
             if (routes_.empty())
@@ -350,7 +447,7 @@ public:
 
     QPushButton& settingsButton() { return settings_; }
 
-    void addRoute(AudioDeviceID input = kAudioObjectUnknown) {
+    void addRoute(AudioDeviceID input = kAudioObjectUnknown, int firstChannel = 0) {
         auto* route = new Route(panels_, routes_.empty());
         routes_.push_back(route);
         routesLayout_->insertWidget(routesLayout_->count() - 1, route);
@@ -358,11 +455,12 @@ public:
         empty_.hide();
         route->refresh(audioDevices());
         if (input != kAudioObjectUnknown)
-            route->selectInput(input);
+            route->selectInput(input, firstChannel);
         connect(&route->addOutputButton(), &QPushButton::clicked, this, [this, route] {
-            addRoute(route->inputDevice());
+            addRoute(route->inputDevice(), route->inputChannel());
         });
         connect(&route->removeButton(), &QPushButton::clicked, this, [this, route] {
+            const int extraHeight = std::max(0, height() - fittedRouteHeight());
             route->deactivate();
             std::erase(routes_, route);
             routesLayout_->removeWidget(route);
@@ -370,6 +468,9 @@ public:
             route->deleteLater();
             scroll_.setVisible(!routes_.empty());
             empty_.setVisible(routes_.empty());
+            const int fitted = fittedRouteHeight() + extraHeight;
+            if (fitted < height())
+                resize(width(), fitted);
             add_.setFocus();
         });
         if (input == kAudioObjectUnknown)
@@ -377,22 +478,39 @@ public:
         else
             route->focusOutput();
         QTimer::singleShot(0, this, [this, route = QPointer<Route>(route)] {
-            if (!route)
+            if (!route || route->isHidden())
                 return;
-            routesLayout_->activate();
-            const auto margins = layout()->contentsMargins();
-            setMinimumWidth(panels_->minimumSizeHint().width() + margins.left() + margins.right() +
-                            scroll_.verticalScrollBar()->sizeHint().width());
-            const int required = routesLayout_->sizeHint().height() + height() - scroll_.viewport()->height();
-            const int limit = screen()->availableGeometry().height() * 3 / 4;
-            const int fitted = std::min(required, limit);
+            updateMinimumWidth();
+            const int fitted = fittedRouteHeight();
             if (fitted > height())
                 resize(width(), fitted);
             scroll_.ensureWidgetVisible(route, 0, 0);
         });
     }
 
+protected:
+    bool eventFilter(QObject* object, QEvent* event) override {
+        if (object == panels_ && event->type() == QEvent::LayoutRequest)
+            updateMinimumWidth();
+        return QDialog::eventFilter(object, event);
+    }
+
 private:
+    int fittedRouteHeight() {
+        layout()->activate();
+        if (routes_.empty())
+            return layout()->sizeHint().height();
+        routesLayout_->activate();
+        const int required = routesLayout_->sizeHint().height() + height() - scroll_.viewport()->height();
+        return std::min(required, screen()->availableGeometry().height() * 3 / 4);
+    }
+
+    void updateMinimumWidth() {
+        const auto margins = layout()->contentsMargins();
+        setMinimumWidth(panels_->minimumSizeHint().width() + margins.left() + margins.right() +
+                        scroll_.verticalScrollBar()->sizeHint().width());
+    }
+
     QScrollArea scroll_;
     QLabel empty_{"No routes"};
     QPushButton settings_{"Settings…"};
@@ -427,7 +545,7 @@ QIcon menuBarIcon() {
     return icon;
 }
 
-int runAuxBridge(int argc, char** argv) {
+int runAuxBridge(int argc, char** argv) try {
     QApplication app(argc, argv);
     app.setApplicationDisplayName("Aux Bridge");
     Window window;
@@ -453,10 +571,13 @@ int runAuxBridge(int argc, char** argv) {
     dockMenu.addAction("Open Aux Bridge", &window, showWindow);
     dockMenu.addAction("Settings…", &settings, showSettings);
     dockMenu.setAsDockMenu();
-    QObject::connect(&app, &QApplication::applicationStateChanged, &window, [&](Qt::ApplicationState state) {
+    QObject::connect(&app, &QApplication::applicationStateChanged, &settings, [&](Qt::ApplicationState state) {
         if (state == Qt::ApplicationActive && !window.isVisible() && !settings.isVisible())
             showWindow();
     });
     window.show();
     return app.exec();
+} catch (...) {
+    std::fputs("Aux Bridge: unexpected application error.\n", stderr);
+    return EXIT_FAILURE;
 }

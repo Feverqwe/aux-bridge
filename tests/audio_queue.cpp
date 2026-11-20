@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cmath>
 #include <numbers>
+#include <vector>
 
 namespace {
 bool near(float sample, float expected) {
@@ -90,6 +91,83 @@ int main() {
     assert(near(stereo.back(), 0.25f));
     assert(queue.drops() == 1);
 
+    {
+        constexpr unsigned rate = 48000;
+        std::array<float, 128> input;
+        std::array<float, 128> output;
+        const auto cycle = [&] {
+            queue.push(input.data(), input.size(), 1);
+            return queue.pull(output.data(), output.size(), 1);
+        };
+
+        // A brief capture stall must not raise the queue delay for the rest of the route.
+        assert(queue.reset(rate, rate, input.size(), output.size()));
+        input.fill(0.25f);
+        for (unsigned i = 0; i < rate / input.size() * 2; ++i)
+            cycle();
+        const auto normalFill = queue.fill();
+        for (unsigned i = 0; i < 38; ++i)
+            queue.pull(output.data(), output.size(), 1);
+        assert(queue.drops() > 0);
+        for (unsigned i = 0; i < rate / input.size() * 15; ++i)
+            cycle();
+        assert(near(output.back(), 0.25f));
+        assert(queue.fill() <= normalFill + rate / 1000);
+
+        // Resume from the live signal after both a short pause and a queue overflow.
+        for (const unsigned pausedBlocks : {38u, 1125u}) {
+            assert(queue.reset(rate, rate, input.size(), output.size()));
+            input.fill(-0.5f);
+            for (unsigned i = 0; i < rate / input.size(); ++i)
+                cycle();
+            for (unsigned i = 0; i < pausedBlocks; ++i) {
+                if (i == pausedBlocks / 2)
+                    input.fill(0.25f);
+                queue.push(input.data(), input.size(), 1);
+            }
+            bool resumed = false;
+            for (unsigned i = 0; i < 10; ++i) {
+                if (cycle()) {
+                    resumed = true;
+                    for (const auto sample : output)
+                        assert(near(sample, 0.25f));
+                }
+            }
+            assert(resumed);
+            assert(queue.fill() < rate / 100);
+        }
+    }
+
+    // Route the selected pair, leaving every other output channel silent.
+    {
+        std::array<float, 64 * 5> input;
+        std::array<float, 64 * 5> output;
+        for (unsigned i = 0; i < input.size(); i += 5) {
+            input[i] = 0.75f;
+            input[i + 1] = 0.75f;
+            input[i + 2] = 0.25f;
+            input[i + 3] = -0.5f;
+            input[i + 4] = 0.5f;
+        }
+        for (const unsigned firstChannel : {2u, 4u}) {
+            assert(queue.reset(48000, 48000, 64, 64));
+            for (unsigned i = 0; i < 8; ++i) {
+                queue.push(input.data(), 64, 5, firstChannel);
+                queue.pull(output.data(), 64, 5, firstChannel);
+            }
+            for (unsigned i = 0; i < output.size(); i += 5) {
+                assert(output[i] == 0 && output[i + 1] == 0);
+                if (firstChannel == 2) {
+                    assert(near(output[i + 2], 0.25f) && near(output[i + 3], -0.5f));
+                    assert(output[i + 4] == 0);
+                } else {
+                    assert(output[i + 2] == 0 && output[i + 3] == 0);
+                    assert(near(output[i + 4], 0.5f));
+                }
+            }
+        }
+    }
+
     // A USB input at 96 kHz and a Bluetooth output at 44.1 kHz arrive in
     // independent blocks. Run long enough for clock drift to exceed a packet.
     for (const double drift : {-0.00015, 0.00015}) {
@@ -134,6 +212,39 @@ int main() {
         assert(queue.drops() == 0);
         assert(observations > 0);
         assert(fillSum / observations / 96.0 < 2.5);
+    }
+
+    // Regular but differently sized capture and playback blocks must not cause dropouts.
+    struct RouteTiming {
+        unsigned inputRate, outputRate, inputFrames, outputFrames;
+        double phase, drift;
+    };
+    for (const auto [inputRate, outputRate, inputFrames, outputFrames, phase, drift] :
+         {RouteTiming{44100, 48000, 128, 128, 0.49, -0.0001},
+          RouteTiming{48000, 44100, 512, 1024, 0.49, -0.0001},
+          RouteTiming{44100, 48000, 512, 32, 0, -0.0001},
+          RouteTiming{48000, 48000, 128, 1024, 0, 0}}) {
+        assert(queue.reset(inputRate, outputRate, inputFrames, outputFrames));
+        std::vector<float> input(inputFrames, 0.25f);
+        std::vector<float> output(outputFrames);
+        double inputTime = 0, outputTime = phase * inputFrames / inputRate;
+        bool started = false;
+        while (outputTime < 8) {
+            if (inputTime <= outputTime) {
+                queue.push(input.data(), inputFrames, 1);
+                inputTime += inputFrames / (inputRate * (1.0 + drift));
+            } else {
+                if (queue.pull(output.data(), outputFrames, 1)) {
+                    if (started)
+                        assert(near(output.front(), 0.25f) && near(output.back(), 0.25f));
+                    started = true;
+                } else {
+                    assert(!started);
+                }
+                outputTime += static_cast<double>(outputFrames) / outputRate;
+            }
+        }
+        assert(started && queue.drops() == 0);
     }
 
     // High frequencies must stay at the right level or be rejected before

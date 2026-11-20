@@ -8,11 +8,13 @@
 #include <cstddef>
 #include <map>
 #include <memory>
+#include <type_traits>
 #include <utility>
 
 namespace {
 constexpr UInt32 outputBus = 0;
 constexpr UInt32 inputBus = 1;
+constexpr UInt32 maxDeviceChannels = 256;
 
 auto address(AudioObjectPropertySelector selector,
              AudioObjectPropertyScope scope = kAudioObjectPropertyScopeGlobal) {
@@ -48,8 +50,11 @@ unsigned channels(AudioDeviceID device, AudioObjectPropertyScope scope) {
     unsigned count = 0;
     const auto* buffers = reinterpret_cast<const AudioBuffer*>(
         memory.data() + offsetof(AudioBufferList, mBuffers));
-    for (UInt32 i = 0; i < list->mNumberBuffers; ++i)
+    for (UInt32 i = 0; i < list->mNumberBuffers; ++i) {
+        if (buffers[i].mNumberChannels > maxDeviceChannels - count)
+            return 0;
         count += buffers[i].mNumberChannels;
+    }
     return count;
 }
 
@@ -57,13 +62,15 @@ std::string deviceName(AudioDeviceID device) {
     auto value = property<CFStringRef>(device, address(kAudioObjectPropertyName));
     if (!value || !*value)
         return "Audio device " + std::to_string(device);
-    const auto length = CFStringGetMaximumSizeForEncoding(CFStringGetLength(*value), kCFStringEncodingUTF8);
+    const std::unique_ptr<std::remove_pointer_t<CFStringRef>, decltype(&CFRelease)> label(*value, CFRelease);
+    const auto length = CFStringGetMaximumSizeForEncoding(CFStringGetLength(label.get()), kCFStringEncodingUTF8);
+    if (length < 0)
+        return "Audio device " + std::to_string(device);
     std::string name(static_cast<std::size_t>(length) + 1, '\0');
-    if (CFStringGetCString(*value, name.data(), length + 1, kCFStringEncodingUTF8))
+    if (CFStringGetCString(label.get(), name.data(), length + 1, kCFStringEncodingUTF8))
         name.resize(name.find('\0'));
     else
         name = "Audio device " + std::to_string(device);
-    CFRelease(*value);
     return name;
 }
 
@@ -73,12 +80,16 @@ struct DeviceFormat {
     UInt32 period;
 };
 
-DeviceFormat formatOf(AudioDeviceID id, bool input) {
+auto deviceScope(bool input) {
+    return input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput;
+}
+
+DeviceFormat formatOf(AudioDeviceID id, bool input, unsigned firstChannel) {
     const auto rate = property<Float64>(id, address(kAudioDevicePropertyNominalSampleRate));
     const auto period = property<UInt32>(id, address(kAudioDevicePropertyBufferFrameSize));
-    auto count = channels(id, input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput);
+    const auto count = channels(id, deviceScope(input));
     if (!rate || !period || !std::isfinite(*rate) || *rate < 8000 || *rate > 768000 ||
-        *period == 0 || *period > 8192 || count == 0 || count > 256)
+        *period == 0 || *period > 8192 || firstChannel >= count)
         throw AudioError{input ? "Read input format" : "Read output format",
                          !rate ? rate.error() : !period ? period.error() : kAudioDeviceUnsupportedFormatError};
     return {*rate, count, *period};
@@ -242,11 +253,13 @@ AudioDeviceID defaultAudioDevice(bool input) {
 struct AudioBridge::Stream {
     static constexpr UInt32 maxInputFrames = 8192;
 
-    Stream(AudioDeviceID input, AudioDeviceID output, float volume)
+    Stream(AudioDeviceID input, AudioDeviceID output, unsigned inputChannel, unsigned outputChannel, float volume)
         : inputId(input), outputId(output),
+          firstInputChannel(inputChannel), firstOutputChannel(outputChannel),
           inputLease(retainDevice(input, true)), outputLease(retainDevice(output, false)),
-          inputFormat(formatOf(input, true)),
-          outputFormat(formatOf(output, false)), inputSamples(maxInputFrames * inputFormat.channels) {
+          inputFormat(formatOf(input, true, firstInputChannel)),
+          outputFormat(formatOf(output, false, firstOutputChannel)),
+          inputSamples(maxInputFrames * inputFormat.channels) {
         queue.setVolume(volume);
         if (!queue.reset(inputFormat.rate, outputFormat.rate, inputFormat.period, outputFormat.period))
             throw AudioError{"Buffer the selected route", kAudioDeviceUnsupportedFormatError};
@@ -278,7 +291,7 @@ struct AudioBridge::Stream {
         AudioBufferList buffers{1, {{channels, bytes, stream.inputSamples.data()}}};
         const auto status = AudioUnitRender(stream.capture.unit, flags, time, inputBus, count, &buffers);
         if (status == noErr)
-            stream.queue.push(stream.inputSamples.data(), count, channels);
+            stream.queue.push(stream.inputSamples.data(), count, channels, stream.firstInputChannel);
         else
             stream.error.store(status, std::memory_order_relaxed);
         return status;
@@ -293,24 +306,24 @@ struct AudioBridge::Stream {
             stream.error.store(kAudioUnitErr_FormatNotSupported, std::memory_order_relaxed);
             return kAudioUnitErr_FormatNotSupported;
         }
-        if (!stream.queue.pull(static_cast<float*>(buffers->mBuffers[0].mData), count, channels))
+        if (!stream.queue.pull(static_cast<float*>(buffers->mBuffers[0].mData), count, channels,
+                               stream.firstOutputChannel))
             *flags |= kAudioUnitRenderAction_OutputIsSilence;
         return noErr;
     }
 
-    bool routeChanged() const {
-        for (const auto& [id, format] : {std::pair{inputId, inputFormat}, std::pair{outputId, outputFormat}}) {
-            const auto alive = property<UInt32>(id, address(kAudioDevicePropertyDeviceIsAlive));
-            const auto rate = property<Float64>(id, address(kAudioDevicePropertyNominalSampleRate));
-            const auto period = property<UInt32>(id, address(kAudioDevicePropertyBufferFrameSize));
-            if (!alive || !*alive || !rate || *rate != format.rate || !period || *period != format.period)
-                return true;
-        }
-        return false;
+    static bool formatChanged(AudioDeviceID id, bool input, const DeviceFormat& format) {
+        const auto alive = property<UInt32>(id, address(kAudioDevicePropertyDeviceIsAlive));
+        const auto rate = property<Float64>(id, address(kAudioDevicePropertyNominalSampleRate));
+        const auto period = property<UInt32>(id, address(kAudioDevicePropertyBufferFrameSize));
+        return !alive || !*alive || !rate || *rate != format.rate || !period || *period != format.period ||
+               channels(id, deviceScope(input)) != format.channels;
     }
 
     const AudioDeviceID inputId;
     const AudioDeviceID outputId;
+    const unsigned firstInputChannel;
+    const unsigned firstOutputChannel;
     const std::shared_ptr<CapturePeriod> inputLease;
     const std::shared_ptr<CapturePeriod> outputLease;
     const DeviceFormat inputFormat;
@@ -326,10 +339,11 @@ struct AudioBridge::Stream {
 AudioBridge::AudioBridge() = default;
 AudioBridge::~AudioBridge() = default;
 
-std::expected<void, AudioError> AudioBridge::start(AudioDeviceID input, AudioDeviceID output) {
+std::expected<void, AudioError> AudioBridge::start(AudioDeviceID input, AudioDeviceID output,
+                                                 unsigned inputChannel, unsigned outputChannel) {
     stop();
     try {
-        stream_ = std::make_unique<Stream>(input, output, volume_);
+        stream_ = std::make_unique<Stream>(input, output, inputChannel, outputChannel, volume_);
     } catch (const AudioError& error) {
         return std::unexpected(error);
     } catch (const std::bad_alloc&) {
@@ -352,4 +366,7 @@ unsigned AudioBridge::dropouts() const noexcept { return stream_ ? stream_->queu
 OSStatus AudioBridge::streamError() const noexcept {
     return stream_ ? stream_->error.load(std::memory_order_relaxed) : noErr;
 }
-bool AudioBridge::routeChanged() const { return stream_ && stream_->routeChanged(); }
+bool AudioBridge::routeChanged() const {
+    return stream_ && (Stream::formatChanged(stream_->inputId, true, stream_->inputFormat) ||
+                       Stream::formatChanged(stream_->outputId, false, stream_->outputFormat));
+}

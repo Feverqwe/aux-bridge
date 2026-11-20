@@ -14,10 +14,11 @@ public:
         ratio_ = inputRate / outputRate;
         const double downsampling = std::max(1.0, ratio_ * (1.0 + maxCorrection));
         radius_ = static_cast<unsigned>(std::ceil(45 * downsampling));
-        reserve_ = std::max(inputPeriod * 0.5 + radius_ + 2.0, inputRate * 0.002);
+        // Keep a capture packet's worth of headroom when callback order varies.
+        reserve_ = std::max(inputPeriod + radius_ + 2.0, inputRate * 0.002);
         maxReserve_ = std::max(reserve_, inputRate * 0.020);
         const double demand = outputPeriod * ratio_;
-        if (demand * (1.0 + maxCorrection) + maxReserve_ + inputPeriod + radius_ + 2 >= capacity)
+        if (demand * (1.0 + maxCorrection) + maxReserve_ + inputPeriod + 2 * radius_ + 2 >= capacity)
             return false;
 
         makeFilter(0.477 / downsampling);
@@ -25,15 +26,22 @@ public:
         write_.store(radius_, std::memory_order_relaxed);
         read_.store(radius_, std::memory_order_relaxed);
         overflows_.store(0, std::memory_order_relaxed);
+        overflowing_ = false;
         seenOverflows_ = 0;
         fill_.store(0, std::memory_order_relaxed);
         drops_.store(0, std::memory_order_relaxed);
         inputPeriod_ = inputPeriod;
+        nominalDemand_ = demand;
         averageFill_ = reserve_;
+        baseReserve_ = reserve_;
         smoothing_ = std::min(1.0, outputPeriod / (outputRate * 0.2));
         correctionGain_ = 1.8 / inputRate;
+        recoveryDelay_ = static_cast<unsigned>(std::ceil(outputRate));
+        recoveryFrames_ = 0;
+        reserveDecay_ = 0.002 * ratio_;
         phase_ = 0;
         primed_ = false;
+        needsHistory_ = false;
         volume_ = targetVolume_.load(std::memory_order_relaxed);
         return true;
     }
@@ -42,30 +50,47 @@ public:
         targetVolume_.store(std::clamp(volume, 0.0f, 1.0f), std::memory_order_relaxed);
     }
 
-    void push(const float* samples, unsigned frames, unsigned channels) noexcept {
+    void push(const float* samples, unsigned frames, unsigned channels, unsigned firstChannel = 0) noexcept {
         const auto write = write_.load(std::memory_order_relaxed);
         const auto read = read_.load(std::memory_order_acquire);
         // Keep the samples before the consumer cursor available to the filter.
         if (frames > capacity - radius_ - (write - read)) {
-            overflows_.fetch_add(1, std::memory_order_relaxed);
+            if (!overflowing_) {
+                overflows_.fetch_add(1, std::memory_order_release);
+                overflowing_ = true;
+            }
             return;
         }
+        overflowing_ = false;
+        const unsigned rightChannel = firstChannel + (firstChannel + 1 < channels);
         for (unsigned i = 0; i < frames; ++i) {
             const auto* source = samples + i * channels;
-            frames_[(write + i) & (capacity - 1)] = {source[0], source[channels > 1 ? 1 : 0]};
+            frames_[(write + i) & (capacity - 1)] = {source[firstChannel], source[rightChannel]};
         }
         write_.store(write + frames, std::memory_order_release);
     }
 
-    bool pull(float* samples, unsigned frames, unsigned channels) noexcept {
+    bool pull(float* samples, unsigned frames, unsigned channels, unsigned firstChannel = 0) noexcept {
         auto read = read_.load(std::memory_order_relaxed);
+        const auto overflows = overflows_.load(std::memory_order_acquire);
         const auto write = write_.load(std::memory_order_acquire);
         auto available = write - read;
         const double demand = frames * ratio_;
-        const auto overflows = overflows_.load(std::memory_order_relaxed);
         if (overflows != seenOverflows_) {
             seenOverflows_ = overflows;
+            // The oldest data survived the overflow. Wait for fresh samples and filter history.
+            read = write;
+            read_.store(read, std::memory_order_release);
+            available = 0;
+            needsHistory_ = true;
             primed_ = false;
+            recoveryFrames_ = 0;
+            drops_.fetch_add(1, std::memory_order_relaxed);
+        } else if (primed_ && available >
+                   std::max(demand, nominalDemand_) * (1.0 + maxCorrection) + maxReserve_ + 2 * inputPeriod_) {
+            // Allow packet bursts during startup before treating a backlog as a playback pause.
+            primed_ = false;
+            recoveryFrames_ = 0;
             drops_.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -73,19 +98,22 @@ public:
             // A starting device can request several blocks close together.
             const double startupReserve = std::min(maxReserve_, reserve_ + std::min(demand, 2.0 * inputPeriod_));
             const auto startFill = static_cast<std::uint64_t>(std::ceil(demand + startupReserve));
-            if (available < startFill) {
+            const unsigned history = needsHistory_ ? radius_ : 0;
+            if (available < startFill + history) {
                 fill_.store(static_cast<unsigned>(available), std::memory_order_relaxed);
                 std::fill_n(samples, static_cast<std::size_t>(frames) * channels, 0.0f);
                 return false;
             }
 
             // Start close to the live signal even when capture is already ahead.
-            if (available > startFill + inputPeriod_) {
+            available -= history;
+            if (available > startFill + inputPeriod_)
                 available = startFill + inputPeriod_ / 2;
-                read = write - available;
-            }
+            read = write - available;
             phase_ = 0;
+            averageFill_ = reserve_;
             primed_ = true;
+            needsHistory_ = false;
         }
 
         const double remainder = std::max(0.0, static_cast<double>(available) - demand);
@@ -101,21 +129,29 @@ public:
             if (playable < frames) {
                 drops_.fetch_add(1, std::memory_order_relaxed);
                 reserve_ = std::min(maxReserve_, reserve_ + inputPeriod_ * 0.5);
+                recoveryFrames_ = 0;
                 std::fill_n(samples + std::size_t{playable} * channels,
                             std::size_t{frames - playable} * channels, 0.0f);
             }
         }
+        if (playable == frames && reserve_ > baseReserve_) {
+            const auto graceFrames = std::min(frames, recoveryDelay_ - recoveryFrames_);
+            recoveryFrames_ += graceFrames;
+            reserve_ = std::max(baseReserve_, reserve_ - (frames - graceFrames) * reserveDecay_);
+        }
 
+        if (channels > 2 || firstChannel != 0)
+            std::fill_n(samples, std::size_t{playable} * channels, 0.0f);
+        const bool stereo = firstChannel + 1 < channels;
         for (unsigned i = 0; i < playable; ++i) {
             const auto offset = static_cast<std::uint64_t>(phase_);
             const auto [left, right] = interpolate(read + offset, phase_ - static_cast<double>(offset));
-            if (channels == 1) {
-                samples[i] = (left + right) * 0.5f;
-            } else {
-                auto* output = samples + i * channels;
+            auto* output = samples + i * channels + firstChannel;
+            if (stereo) {
                 output[0] = left;
                 output[1] = right;
-                std::fill(output + 2, output + channels, 0.0f);
+            } else {
+                output[0] = (left + right) * 0.5f;
             }
             phase_ += step;
         }
@@ -124,9 +160,10 @@ public:
         if (playable && (volume_ != 1.0f || target != 1.0f)) {
             for (unsigned i = 0; i < playable; ++i) {
                 const auto gain = std::lerp(volume_, target, static_cast<float>(i + 1) / playable);
-                auto* output = samples + i * channels;
-                for (unsigned channel = 0; channel < channels; ++channel)
-                    output[channel] *= gain;
+                auto* output = samples + i * channels + firstChannel;
+                output[0] *= gain;
+                if (stereo)
+                    output[1] *= gain;
             }
         }
         volume_ = target;
@@ -202,16 +239,23 @@ private:
     std::atomic<unsigned> fill_{0};
     std::atomic<unsigned> drops_{0};
     std::atomic<float> targetVolume_{1.0f};
+    bool overflowing_ = false;
     float volume_ = 1.0f;
     unsigned seenOverflows_ = 0;
     unsigned radius_ = 0;
     double ratio_ = 1;
+    double nominalDemand_ = 0;
     unsigned inputPeriod_ = 0;
+    unsigned recoveryDelay_ = 0;
+    unsigned recoveryFrames_ = 0;
+    double baseReserve_ = 0;
     double reserve_ = 0;
+    double reserveDecay_ = 0;
     double maxReserve_ = 0;
     double phase_ = 0;
     double averageFill_ = 0;
     double smoothing_ = 0;
     double correctionGain_ = 0;
     bool primed_ = false;
+    bool needsHistory_ = false;
 };

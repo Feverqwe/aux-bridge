@@ -27,7 +27,8 @@ public:
     AudioBridge();
     ~AudioBridge();
 
-    std::expected<void, AudioError> start(AudioDeviceID input, AudioDeviceID output);
+    std::expected<void, AudioError> start(AudioDeviceID input, AudioDeviceID output,
+                                         unsigned inputChannel = 0, unsigned outputChannel = 0);
     void stop();
     void setVolume(float volume) noexcept;
     bool running() const noexcept;

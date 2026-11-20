@@ -4,6 +4,8 @@
 
 [**Get Aux Bridge**](https://github.com/Feverqwe/aux-bridge/releases) · Apple Silicon · macOS 14.4 or later
 
+Release downloads are ad-hoc signed. If macOS asks you to approve the app the first time you open it, see [Apple’s instructions for opening a downloaded app](https://support.apple.com/en-us/102445).
+
 <p align="center">
   <img src="assets/aux-bridge.png" alt="Aux Bridge on macOS with two routes from a USB audio interface, each with its own output and volume slider" width="640">
 </p>
@@ -19,6 +21,8 @@
 1. Choose an **Input** and **Output**.
 2. Click **Start** and allow microphone access when macOS asks. The same permission covers external inputs.
 3. Click **Add Route** to set up another connection.
+
+For a device with more than two channels, use its channel menu to pick the input or output you want.
 
 Bluetooth devices add their own playback delay.
 
