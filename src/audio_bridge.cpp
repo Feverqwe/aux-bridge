@@ -6,6 +6,7 @@
 
 #include <bit>
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <utility>
 
@@ -85,7 +86,9 @@ DeviceFormat formatOf(AudioDeviceID id, bool input) {
 
 class CapturePeriod {
 public:
-    explicit CapturePeriod(AudioDeviceID device) : device_(device) {
+    CapturePeriod(AudioDeviceID device, bool capture) : device_(device) {
+        if (!capture)
+            return;
         const auto used = property<UInt32>(device_, address(kAudioDevicePropertyDeviceIsRunningSomewhere));
         const auto rate = property<Float64>(device_, address(kAudioDevicePropertyNominalSampleRate));
         const auto current = property<UInt32>(device_, key_);
@@ -125,6 +128,18 @@ private:
     UInt32 original_ = 0;
     UInt32 chosen_ = 0;
 };
+
+std::shared_ptr<CapturePeriod> retainDevice(AudioDeviceID id, bool capture) {
+    // Route starts and stops are serialized on the UI thread.
+    static std::map<AudioDeviceID, std::weak_ptr<CapturePeriod>> periods;
+    std::erase_if(periods, [](const auto& entry) { return entry.second.expired(); });
+    auto& entry = periods[id];
+    if (auto period = entry.lock())
+        return period;
+    auto period = std::make_shared<CapturePeriod>(id, capture);
+    entry = period;
+    return period;
+}
 
 void check(OSStatus status, const char* stage) {
     if (status != noErr)
@@ -227,9 +242,12 @@ AudioDeviceID defaultAudioDevice(bool input) {
 struct AudioBridge::Stream {
     static constexpr UInt32 maxInputFrames = 8192;
 
-    Stream(AudioDeviceID input, AudioDeviceID output)
-        : inputId(input), outputId(output), capturePeriod(input), inputFormat(formatOf(input, true)),
+    Stream(AudioDeviceID input, AudioDeviceID output, float volume)
+        : inputId(input), outputId(output),
+          inputLease(retainDevice(input, true)), outputLease(retainDevice(output, false)),
+          inputFormat(formatOf(input, true)),
           outputFormat(formatOf(output, false)), inputSamples(maxInputFrames * inputFormat.channels) {
+        queue.setVolume(volume);
         if (!queue.reset(inputFormat.rate, outputFormat.rate, inputFormat.period, outputFormat.period))
             throw AudioError{"Buffer the selected route", kAudioDeviceUnsupportedFormatError};
         capture.open(inputId, true, inputFormat);
@@ -293,7 +311,8 @@ struct AudioBridge::Stream {
 
     const AudioDeviceID inputId;
     const AudioDeviceID outputId;
-    CapturePeriod capturePeriod;
+    const std::shared_ptr<CapturePeriod> inputLease;
+    const std::shared_ptr<CapturePeriod> outputLease;
     const DeviceFormat inputFormat;
     const DeviceFormat outputFormat;
     std::vector<float> inputSamples;
@@ -310,7 +329,7 @@ AudioBridge::~AudioBridge() = default;
 std::expected<void, AudioError> AudioBridge::start(AudioDeviceID input, AudioDeviceID output) {
     stop();
     try {
-        stream_ = std::make_unique<Stream>(input, output);
+        stream_ = std::make_unique<Stream>(input, output, volume_);
     } catch (const AudioError& error) {
         return std::unexpected(error);
     } catch (const std::bad_alloc&) {
@@ -320,6 +339,11 @@ std::expected<void, AudioError> AudioBridge::start(AudioDeviceID input, AudioDev
 }
 
 void AudioBridge::stop() { stream_.reset(); }
+void AudioBridge::setVolume(float volume) noexcept {
+    volume_ = volume;
+    if (stream_)
+        stream_->queue.setVolume(volume);
+}
 bool AudioBridge::running() const noexcept { return static_cast<bool>(stream_); }
 double AudioBridge::queueMilliseconds() const noexcept {
     return stream_ ? stream_->queue.fill() * 1000.0 / stream_->inputFormat.rate : 0;

@@ -29,6 +29,7 @@ public:
 
     std::expected<void, AudioError> start(AudioDeviceID input, AudioDeviceID output);
     void stop();
+    void setVolume(float volume) noexcept;
     bool running() const noexcept;
     double queueMilliseconds() const noexcept;
     unsigned dropouts() const noexcept;
@@ -38,4 +39,5 @@ public:
 private:
     struct Stream;
     std::unique_ptr<Stream> stream_;
+    float volume_ = 1.0f;
 };
