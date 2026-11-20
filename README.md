@@ -7,7 +7,7 @@
 Release downloads are ad-hoc signed. If macOS asks you to approve the app the first time you open it, see [Apple’s instructions for opening a downloaded app](https://support.apple.com/en-us/102445).
 
 <p align="center">
-  <img src="assets/aux-bridge.png" alt="Aux Bridge on macOS with two routes from a USB audio interface, each with its own output and volume slider" width="640">
+  <img src="assets/aux-bridge.png" alt="Aux Bridge on macOS routing USB input channels 3–4 to two speakers with separate volume sliders" width="640">
 </p>
 
 ## Your audio, where you want it
