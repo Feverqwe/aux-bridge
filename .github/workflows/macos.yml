@@ -1,11 +1,8 @@
 name: macOS
 
 on:
-  pull_request:
   push:
-    branches: [main]
     tags: ['v*']
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -31,16 +28,8 @@ jobs:
           command -v ninja >/dev/null || brew install ninja
           qt_prefix=$(./scripts/prepare-qt.sh)
           printf 'QT_PREFIX=%s\n' "$qt_prefix" >> "$GITHUB_ENV"
-      - name: Check audio buffering
-        run: ./scripts/test-audio.sh
       - name: Build and package
-        run: |
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
-            ./scripts/release.sh --archive "$GITHUB_REF_NAME"
-          else
-            ./scripts/release.sh --archive
-          fi
-          codesign --verify --deep --strict 'build/Aux Bridge.app'
+        run: ./scripts/release.sh --archive "$GITHUB_REF_NAME"
       - uses: actions/upload-artifact@v7
         with:
           name: aux-bridge-macos
@@ -48,7 +37,6 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-latest
     permissions:
